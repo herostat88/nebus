@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+!.env.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+.venv
+**/__pycache__
+**/*.egg-info
+.pytest_cache
+.ruff_cache
+.coverage

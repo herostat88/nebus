@@ -1,0 +1,129 @@
+name: nebus-payments
+
+x-environment: &environment
+  DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-development-db-password}@postgres:5432/${POSTGRES_DB:-payments}}
+  RABBITMQ_URL: ${RABBITMQ_URL:-amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-development-mq-password}@rabbitmq:5672/}
+  API_KEY: ${API_KEY:-development-api-key-change-me}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-development-webhook-secret-change-before-production}
+  WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-webhook}
+  WEBHOOK_ALLOWED_PORTS: ${WEBHOOK_ALLOWED_PORTS:-80,443,8080}
+
+x-application: &application
+  build:
+    context: .
+    target: runtime
+  env_file:
+    - path: .env
+      required: false
+  environment: *environment
+  init: true
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-development-db-password}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.2-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-payments}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-development-mq-password}
+    volumes: ["rabbit_data:/var/lib/rabbitmq"]
+    ports: ["127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15673}:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    <<: *application
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  api:
+    <<: *application
+    ports: ["127.0.0.1:${API_PORT:-8010}:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-m", "payments.healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  consumer:
+    <<: *application
+    command: ["python", "-m", "payments.consumer"]
+    stop_grace_period: ${CONSUMER_STOP_GRACE_PERIOD:-35s}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; raise SystemExit(not Path('/tmp/consumer-ready').is_file())"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  webhook:
+    <<: *application
+    command: ["uvicorn", "payments.demo_webhook:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports: ["127.0.0.1:${WEBHOOK_PORT:-8011}:8080"]
+
+  postgres_test:
+    image: postgres:17-alpine
+    profiles: [test]
+    environment:
+      POSTGRES_DB: payments_test
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: test-database-password
+    tmpfs: ["/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq_test:
+    image: rabbitmq:4.2-management
+    profiles: [test]
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: test-broker-password
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  tests:
+    build: {context: ., target: test}
+    profiles: [test]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:test-database-password@postgres_test:5432/payments_test
+      RABBITMQ_URL: amqp://payments:test-broker-password@rabbitmq_test:5672/
+      API_KEY: test-api-key-not-for-production
+      WEBHOOK_SECRET: test-webhook-secret-not-for-production
+      GATEWAY_DELAY_MIN: "0"
+      GATEWAY_DELAY_MAX: "0"
+      WEBHOOK_ALLOWED_HOSTS: webhook
+    depends_on:
+      postgres_test: {condition: service_healthy}
+      rabbitmq_test: {condition: service_healthy}
+
+volumes:
+  postgres_data:
+  rabbit_data:
